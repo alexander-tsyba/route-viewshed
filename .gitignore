@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+node_modules/
+dist/
+.vite/
+*.hgt
+*.hgt.gz
+srtm_cache/
+.venv/
+.DS_Store

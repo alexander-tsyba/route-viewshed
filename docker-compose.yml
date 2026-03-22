@@ -1,0 +1,22 @@
+services:
+  backend:
+    build: ./backend
+    volumes:
+      - srtm-cache:/tmp/srtm_cache
+    environment:
+      - SRTM_CACHE_DIR=/tmp/srtm_cache
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        - VITE_API_URL=
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  srtm-cache:
