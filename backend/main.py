@@ -83,8 +83,11 @@ async def compute_route_viewshed(req: RouteRequest):
     t_elev = time.time()
 
     # 5. Load land cover (forests/buildings)
+    # Cap landcover buffer at 5km — buildings/forests beyond that
+    # have negligible impact on visibility and Overpass gets too slow
     if req.include_landcover:
-        await landcover_provider.load_obstacles_for_route(coords, buffer_km=max_dist_km)
+        lc_buffer = min(max_dist_km, 5)
+        await landcover_provider.load_obstacles_for_route(coords, buffer_km=lc_buffer)
     t_lc = time.time()
 
     # 6. Compute viewshed

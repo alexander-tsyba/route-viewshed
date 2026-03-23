@@ -195,10 +195,10 @@ function App() {
               key={i}
               positions={ring}
               pathOptions={{
-                color: "#22c55e",
+                color: "#16a34a",
                 fillColor: "#22c55e",
-                fillOpacity: 0.25,
-                weight: 1,
+                fillOpacity: 0.35,
+                weight: 2,
               }}
             />
           ))}
