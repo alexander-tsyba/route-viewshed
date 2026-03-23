@@ -9,9 +9,6 @@ from landcover import LandCoverProvider, OBSTACLE_HEIGHT
 
 EARTH_RADIUS = 6_371_000  # meters
 OBSERVER_HEIGHT = 1.5  # eye height in car
-# Geometric horizon at sea level: sqrt(2 * R * h) ≈ 4.4 km for h=1.5m
-# But from elevated positions it can be much more.
-# We cap at a practical maximum.
 MAX_VIEW_DISTANCE = 30_000  # 30 km absolute max
 RAY_ANGULAR_STEP = 2.0  # degrees between rays
 RAY_DISTANCE_STEP = 100  # meters between samples along each ray
@@ -31,36 +28,50 @@ def compute_viewshed_for_route(
     Returns a list of polygon rings (each ring = list of [lon, lat]).
     """
     prepared_obstacles = landcover.get_prepared()
-    all_visible_points = []
+    fan_polys = []
 
     for idx, pt in enumerate(sampled_points):
         if progress_callback and idx % 50 == 0:
             progress_callback(idx, len(sampled_points))
 
-        visible = _compute_single_viewshed(
+        fan = _compute_single_viewshed_fan(
             pt["lon"], pt["lat"], pt["bearing"],
             elevation, prepared_obstacles,
             max_distance, ray_step_deg, distance_step,
         )
-        all_visible_points.extend(visible)
+        if fan is not None:
+            fan_polys.append(fan)
 
-    if not all_visible_points:
+    if not fan_polys:
         return []
 
-    # Build polygon from all visible points using convex hull of clusters
-    # We use a buffered point union approach for efficiency
-    return _build_visibility_polygon(all_visible_points, distance_step)
+    # Union all fan polygons and simplify
+    merged = unary_union(fan_polys)
+    # Simplify: ~50m tolerance in degrees
+    tol = 50 / 111_320
+    simplified = merged.simplify(tol)
+
+    rings = []
+    if isinstance(simplified, Polygon):
+        if not simplified.is_empty:
+            rings.append([[c[0], c[1]] for c in simplified.exterior.coords])
+    elif isinstance(simplified, MultiPolygon):
+        for poly in simplified.geoms:
+            if not poly.is_empty:
+                rings.append([[c[0], c[1]] for c in poly.exterior.coords])
+
+    return rings
 
 
-def _compute_single_viewshed(
+def _compute_single_viewshed_fan(
     lon: float, lat: float, bearing: float,
     elevation: ElevationProvider,
     prepared_obstacles,
     max_distance: float,
     ray_step_deg: float,
     distance_step: float,
-) -> List[List[float]]:
-    """Cast rays from a single point and return visible [lon, lat] points."""
+) -> Optional[Polygon]:
+    """Cast rays from a single point, return a fan-shaped polygon of visible area."""
 
     observer_elev = elevation.get_elevation(lat, lon) + OBSERVER_HEIGHT
 
@@ -72,25 +83,50 @@ def _compute_single_viewshed(
 
     # 180 degree arc centered on bearing (direction of travel)
     start_angle = (bearing - 90) % 360
-    end_angle = (bearing + 90) % 360
-
-    visible_points = []
-    angle = start_angle
     n_rays = int(180 / ray_step_deg)
+
+    lat_deg_per_m = 1 / 111_320
+    lon_deg_per_m = 1 / (111_320 * max(math.cos(math.radians(lat)), 0.001))
+
+    # For each ray, find the maximum visible distance
+    boundary_points = []
 
     for i in range(n_rays + 1):
         angle = (start_angle + i * ray_step_deg) % 360
-        ray_points = _cast_ray(
+        max_visible_dist = _cast_ray_max_distance(
             lon, lat, observer_elev, angle,
             horizon_dist, distance_step,
             elevation, prepared_obstacles,
+            lat_deg_per_m, lon_deg_per_m,
         )
-        visible_points.extend(ray_points)
 
-    return visible_points
+        # Convert max visible distance to a point
+        angle_rad = math.radians(angle)
+        end_lon = lon + max_visible_dist * math.sin(angle_rad) * lon_deg_per_m
+        end_lat = lat + max_visible_dist * math.cos(angle_rad) * lat_deg_per_m
+        boundary_points.append((end_lon, end_lat))
+
+    # Build fan polygon: origin + boundary arc + back to origin
+    coords = [(lon, lat)] + boundary_points + [(lon, lat)]
+
+    try:
+        poly = Polygon(coords)
+        if poly.is_valid and poly.area > 0:
+            return poly
+        # Try to fix
+        poly = poly.buffer(0)
+        if isinstance(poly, Polygon) and poly.area > 0:
+            return poly
+        if isinstance(poly, MultiPolygon):
+            biggest = max(poly.geoms, key=lambda g: g.area)
+            return biggest
+    except Exception:
+        pass
+
+    return None
 
 
-def _cast_ray(
+def _cast_ray_max_distance(
     origin_lon: float, origin_lat: float,
     observer_elev: float,
     angle_deg: float,
@@ -98,32 +134,33 @@ def _cast_ray(
     step: float,
     elevation: ElevationProvider,
     prepared_obstacles,
-) -> List[List[float]]:
-    """Cast a single ray and return visible points along it."""
+    lat_deg_per_m: float,
+    lon_deg_per_m: float,
+) -> float:
+    """Cast a single ray and return the maximum visible distance along it.
 
-    visible = []
-    max_tan_angle = float("-inf")  # track maximum tangent angle seen so far
+    Uses the "maximum angle" algorithm: a point is visible if the angle from
+    the observer to it (accounting for curvature) exceeds all previous angles.
+    Returns the distance of the farthest visible point.
+    """
+    max_tan_angle = float("-inf")
+    max_visible_dist = step  # at minimum, can see the first step
 
     angle_rad = math.radians(angle_deg)
     cos_angle = math.cos(angle_rad)
     sin_angle = math.sin(angle_rad)
 
-    # Convert step to approximate degree offsets
-    lat_deg_per_m = 1 / 111_320
-    lon_deg_per_m = 1 / (111_320 * max(math.cos(math.radians(origin_lat)), 0.001))
-
     dist = step
+    blocked = False
+
     while dist <= max_dist:
-        # Destination point
         dlat = dist * cos_angle * lat_deg_per_m
         dlon = dist * sin_angle * lon_deg_per_m
         target_lat = origin_lat + dlat
         target_lon = origin_lon + dlon
 
-        # Get terrain elevation at target
         terrain_elev = elevation.get_elevation(target_lat, target_lon)
 
-        # Add obstacle height if in forest/building
         effective_elev = terrain_elev
         if prepared_obstacles is not None:
             try:
@@ -132,66 +169,25 @@ def _cast_ray(
             except Exception:
                 pass
 
-        # Earth curvature correction: at distance d, apparent drop = d²/(2R)
+        # Earth curvature correction
         curvature_drop = (dist * dist) / (2 * EARTH_RADIUS)
 
-        # Tangent angle from observer to this point (accounting for curvature)
         apparent_elev = effective_elev - curvature_drop
         delta_elev = apparent_elev - observer_elev
         tan_angle = delta_elev / dist
 
         if tan_angle >= max_tan_angle:
-            # This point is visible — the line of sight clears all previous terrain
-            visible.append([target_lon, target_lat])
+            # Visible — update max visible distance
+            max_visible_dist = dist
             max_tan_angle = tan_angle
+            blocked = False
         else:
-            # Hidden behind previous terrain — update max if this blocks further
-            max_tan_angle = max(max_tan_angle, tan_angle)
+            # Hidden — but keep going, might see over a ridge
+            if not blocked and (effective_elev + OBSTACLE_HEIGHT - curvature_drop - observer_elev) / dist > max_tan_angle + 0.05:
+                # Solid tall obstacle — stop
+                break
+            blocked = True
 
         dist += step
 
-    return visible
-
-
-def _build_visibility_polygon(
-    visible_points: List[List[float]],
-    resolution: float,
-) -> List[List[List[float]]]:
-    """Convert visible points into polygon rings for display.
-
-    Uses buffered point union — each visible point becomes a small circle,
-    then we union them all and simplify.
-    """
-    if not visible_points:
-        return []
-
-    # Buffer radius: use 1.5x the ray distance step to ensure overlap between
-    # adjacent ray sample points, producing a connected polygon
-    buf_deg = (resolution * 1.5) / 111_320
-
-    # Process in chunks for memory efficiency
-    chunk_size = 20_000
-    polys = []
-
-    for i in range(0, len(visible_points), chunk_size):
-        chunk = visible_points[i:i + chunk_size]
-        points = [Point(p[0], p[1]).buffer(buf_deg, resolution=4) for p in chunk]
-        if points:
-            merged = unary_union(points)
-            polys.append(merged)
-
-    if not polys:
-        return []
-
-    total = unary_union(polys)
-    # Aggressively simplify to reduce polygon vertex count for frontend
-    simplified = total.simplify(buf_deg * 2)
-
-    rings = []
-    if isinstance(simplified, Polygon):
-        rings.append([[c[0], c[1]] for c in simplified.exterior.coords])
-    elif isinstance(simplified, MultiPolygon):
-        for poly in simplified.geoms:
-            rings.append([[c[0], c[1]] for c in poly.exterior.coords])
-
-    return rings
+    return max_visible_dist
