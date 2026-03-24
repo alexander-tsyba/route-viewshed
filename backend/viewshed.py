@@ -44,20 +44,54 @@ def compute_viewshed_for_route(
     if not fan_polys:
         return []
 
-    # Union all fan polygons and simplify
+    # Union all fan polygons
     merged = unary_union(fan_polys)
-    tol = 50 / 111_320  # ~50m
-    simplified = merged.simplify(tol)
 
+    # Morphological smoothing to remove thin spikes and round edges.
+    #
+    # Strategy: adaptive erosion based on viewshed size.
+    # In cities (small viewshed), use gentle smoothing.
+    # In open terrain (large viewshed), use aggressive spike removal.
+    area_deg2 = merged.area
+    area_km2_approx = area_deg2 * (111.32 ** 2)
+
+    if area_km2_approx > 50:
+        erode_m = 150  # open terrain: remove spikes < 300m wide
+    elif area_km2_approx > 5:
+        erode_m = 80   # suburban: remove spikes < 160m wide
+    else:
+        erode_m = 30   # dense city: only remove < 60m noise
+
+    erode_deg = erode_m / 111_320
+
+    # Opening: erode then dilate — removes thin spikes
+    opened = merged.buffer(-erode_deg).buffer(erode_deg)
+    if opened.is_empty:
+        opened = merged
+
+    # Closing: dilate then erode — fills small holes and rounds edges
+    close_deg = erode_deg * 0.7
+    closed = opened.buffer(close_deg).buffer(-close_deg)
+    if closed.is_empty:
+        closed = opened
+
+    # Simplify to reduce vertex count
+    tol = max(30, erode_m * 0.5) / 111_320
+    simplified = closed.simplify(tol)
+
+    return _extract_rings(simplified)
+
+
+def _extract_rings(geom) -> List[List[List[float]]]:
+    """Extract polygon exterior rings from a Shapely geometry."""
     rings = []
-    if isinstance(simplified, Polygon):
-        if not simplified.is_empty:
-            rings.append([[c[0], c[1]] for c in simplified.exterior.coords])
-    elif isinstance(simplified, MultiPolygon):
-        for poly in simplified.geoms:
+    if isinstance(geom, Polygon):
+        if not geom.is_empty:
+            rings.append([[c[0], c[1]] for c in geom.exterior.coords])
+    elif isinstance(geom, MultiPolygon):
+        for poly in geom.geoms:
             if not poly.is_empty:
                 rings.append([[c[0], c[1]] for c in poly.exterior.coords])
-
     return rings
 
 

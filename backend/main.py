@@ -23,8 +23,11 @@ app.add_middleware(
 elevation_provider = ElevationProvider()
 landcover_provider = LandCoverProvider()
 
-# Fixed buffer for data downloads — 30km matches atmospheric max
-ELEVATION_BUFFER_KM = ATMOSPHERIC_MAX / 1000  # 30
+# Elevation buffer: 15km covers the typical max ray distance.
+# Geometric horizon from 1.5m eye height is ~9km. From elevated terrain
+# rays can go further, but SRTM tiles are 1°×1° (~111km) so the actual
+# number of tiles barely changes between 15km and 30km.
+ELEVATION_BUFFER_KM = 15
 LANDCOVER_BUFFER_KM = 5  # forests/buildings beyond 5km negligible
 
 
