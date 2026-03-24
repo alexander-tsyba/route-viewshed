@@ -8,7 +8,7 @@ from typing import Optional
 from routing import get_route, sample_route_points
 from elevation import ElevationProvider
 from landcover import LandCoverProvider
-from viewshed import compute_viewshed_for_route, ATMOSPHERIC_MAX
+from viewshed import compute_viewshed_for_route
 from geocode import geocode
 
 app = FastAPI(title="Route Viewshed API")
@@ -23,11 +23,10 @@ app.add_middleware(
 elevation_provider = ElevationProvider()
 landcover_provider = LandCoverProvider()
 
-# Elevation buffer: 15km covers the typical max ray distance.
-# Geometric horizon from 1.5m eye height is ~9km. From elevated terrain
-# rays can go further, but SRTM tiles are 1°×1° (~111km) so the actual
-# number of tiles barely changes between 15km and 30km.
-ELEVATION_BUFFER_KM = 15
+# Elevation buffer: determines how far around the route we download SRTM tiles.
+# In mountains (2000m+), visibility can reach 80km, but SRTM tiles are 1°×1°
+# (~111km) so loading a few extra tiles is cheap. Use 50km to cover mountain cases.
+ELEVATION_BUFFER_KM = 50
 LANDCOVER_BUFFER_KM = 5  # forests/buildings beyond 5km negligible
 
 

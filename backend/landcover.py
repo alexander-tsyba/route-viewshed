@@ -147,6 +147,12 @@ class LandCoverProvider:
         from shapely.geometry import Point
         return self._obstacles.contains(Point(lon, lat))
 
+    def get_obstacles(self):
+        """Return the raw obstacle geometry for intersection checks."""
+        if self._obstacles is None or self._obstacles.is_empty:
+            return None
+        return self._obstacles
+
     def get_prepared(self):
         """Return a prepared geometry for fast repeated containment checks."""
         if self._obstacles is None or self._obstacles.is_empty:
