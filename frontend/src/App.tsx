@@ -38,7 +38,6 @@ function FitBounds({ coords }: { coords: number[][] }) {
 function App() {
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
-  const [maxDist, setMaxDist] = useState(15);
   const [includeLandcover, setIncludeLandcover] = useState(true);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState("");
@@ -61,7 +60,6 @@ function App() {
         body: JSON.stringify({
           start: start.trim(),
           end: end.trim(),
-          max_view_distance_km: maxDist,
           include_landcover: includeLandcover,
         }),
       });
@@ -115,18 +113,6 @@ function App() {
               value={end}
               onChange={(e) => setEnd(e.target.value)}
               placeholder="e.g. Munich or 48.137,11.576"
-              disabled={loading}
-            />
-          </label>
-
-          <label>
-            Max view distance: {maxDist} km
-            <input
-              type="range"
-              min={1}
-              max={30}
-              value={maxDist}
-              onChange={(e) => setMaxDist(Number(e.target.value))}
               disabled={loading}
             />
           </label>

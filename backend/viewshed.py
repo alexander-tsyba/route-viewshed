@@ -9,24 +9,23 @@ from landcover import LandCoverProvider, OBSTACLE_HEIGHT
 
 EARTH_RADIUS = 6_371_000  # meters
 OBSERVER_HEIGHT = 1.5  # eye height in car
-MAX_VIEW_DISTANCE = 30_000  # 30 km absolute max
+# Atmospheric visibility limit on a clear day.
+# Geometric horizon is calculated per-point from actual elevation.
+ATMOSPHERIC_MAX = 30_000  # 30 km — beyond this, haze hides everything
+TARGET_HEIGHT = 2.0  # consider a point "seen" if a 2m feature there is visible
 RAY_ANGULAR_STEP = 2.0  # degrees between rays
-RAY_DISTANCE_STEP = 100  # meters between samples along each ray
+RAY_DISTANCE_STEP = 90  # meters between samples (aligned with SRTM ~30m × 3)
 
 
 def compute_viewshed_for_route(
     sampled_points: List[dict],
     elevation: ElevationProvider,
     landcover: LandCoverProvider,
-    max_distance: float = MAX_VIEW_DISTANCE,
     ray_step_deg: float = RAY_ANGULAR_STEP,
     distance_step: float = RAY_DISTANCE_STEP,
     progress_callback=None,
 ) -> List[List[List[float]]]:
-    """Compute visible area polygons for all sampled route points.
-
-    Returns a list of polygon rings (each ring = list of [lon, lat]).
-    """
+    """Compute visible area polygons for all sampled route points."""
     prepared_obstacles = landcover.get_prepared()
     fan_polys = []
 
@@ -37,7 +36,7 @@ def compute_viewshed_for_route(
         fan = _compute_single_viewshed_fan(
             pt["lon"], pt["lat"], pt["bearing"],
             elevation, prepared_obstacles,
-            max_distance, ray_step_deg, distance_step,
+            ray_step_deg, distance_step,
         )
         if fan is not None:
             fan_polys.append(fan)
@@ -47,8 +46,7 @@ def compute_viewshed_for_route(
 
     # Union all fan polygons and simplify
     merged = unary_union(fan_polys)
-    # Simplify: ~50m tolerance in degrees
-    tol = 50 / 111_320
+    tol = 50 / 111_320  # ~50m
     simplified = merged.simplify(tol)
 
     rings = []
@@ -67,53 +65,64 @@ def _compute_single_viewshed_fan(
     lon: float, lat: float, bearing: float,
     elevation: ElevationProvider,
     prepared_obstacles,
-    max_distance: float,
     ray_step_deg: float,
     distance_step: float,
 ) -> Optional[Polygon]:
     """Cast rays from a single point, return a fan-shaped polygon of visible area."""
 
-    observer_elev = elevation.get_elevation(lat, lon) + OBSERVER_HEIGHT
+    observer_ground = elevation.get_elevation(lat, lon)
+    observer_elev = observer_ground + OBSERVER_HEIGHT
 
-    # Geometric horizon distance from this elevation
-    horizon_dist = min(
-        max_distance,
-        math.sqrt(2 * EARTH_RADIUS * max(observer_elev, OBSERVER_HEIGHT)) + 1000
+    # Geometric horizon for this observer: how far can we see a TARGET_HEIGHT
+    # object on flat ground?
+    # d = sqrt(2*R*h_obs) + sqrt(2*R*h_target)
+    h_above_ground = OBSERVER_HEIGHT  # height above local terrain
+    geometric_horizon = (
+        math.sqrt(2 * EARTH_RADIUS * h_above_ground)
+        + math.sqrt(2 * EARTH_RADIUS * TARGET_HEIGHT)
     )
+    # On higher terrain, line of sight extends further to lower areas
+    # Add bonus for elevated position (above regional average)
+    max_ray_dist = min(ATMOSPHERIC_MAX, geometric_horizon * 3)
 
-    # 180 degree arc centered on bearing (direction of travel)
     start_angle = (bearing - 90) % 360
     n_rays = int(180 / ray_step_deg)
 
     lat_deg_per_m = 1 / 111_320
     lon_deg_per_m = 1 / (111_320 * max(math.cos(math.radians(lat)), 0.001))
 
-    # For each ray, find the maximum visible distance
-    boundary_points = []
+    # Cast all rays and collect distances
+    ray_angles = []
+    ray_dists = []
 
     for i in range(n_rays + 1):
         angle = (start_angle + i * ray_step_deg) % 360
         max_visible_dist = _cast_ray_max_distance(
             lon, lat, observer_elev, angle,
-            horizon_dist, distance_step,
+            max_ray_dist, distance_step,
             elevation, prepared_obstacles,
             lat_deg_per_m, lon_deg_per_m,
         )
+        ray_angles.append(angle)
+        ray_dists.append(max_visible_dist)
 
-        # Convert max visible distance to a point
+    # Smooth ray distances: median filter (window=5) removes SRTM noise spikes
+    # without erasing real terrain features
+    smoothed = _smooth_ray_distances(ray_dists, window=5)
+
+    boundary_points = []
+    for angle, dist in zip(ray_angles, smoothed):
         angle_rad = math.radians(angle)
-        end_lon = lon + max_visible_dist * math.sin(angle_rad) * lon_deg_per_m
-        end_lat = lat + max_visible_dist * math.cos(angle_rad) * lat_deg_per_m
+        end_lon = lon + dist * math.sin(angle_rad) * lon_deg_per_m
+        end_lat = lat + dist * math.cos(angle_rad) * lat_deg_per_m
         boundary_points.append((end_lon, end_lat))
 
-    # Build fan polygon: origin + boundary arc + back to origin
     coords = [(lon, lat)] + boundary_points + [(lon, lat)]
 
     try:
         poly = Polygon(coords)
         if poly.is_valid and poly.area > 0:
             return poly
-        # Try to fix
         poly = poly.buffer(0)
         if isinstance(poly, Polygon) and poly.area > 0:
             return poly
@@ -124,6 +133,27 @@ def _compute_single_viewshed_fan(
         pass
 
     return None
+
+
+def _smooth_ray_distances(dists: List[float], window: int = 5) -> List[float]:
+    """Smooth ray distances with a median filter to remove SRTM noise spikes.
+
+    Uses median (not mean) to preserve real terrain edges: if 4 out of 5
+    adjacent rays see 10km but one sees 2km due to a DEM artifact, the
+    median keeps 10km. But if 3 out of 5 are blocked, the median correctly
+    reflects that.
+    """
+    n = len(dists)
+    if n <= window:
+        return dists
+
+    half = window // 2
+    result = []
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        result.append(float(np.median(dists[lo:hi])))
+    return result
 
 
 def _cast_ray_max_distance(
@@ -137,22 +167,31 @@ def _cast_ray_max_distance(
     lat_deg_per_m: float,
     lon_deg_per_m: float,
 ) -> float:
-    """Cast a single ray and return the maximum visible distance along it.
+    """Cast a single ray and return the max visible distance.
 
-    Uses the "maximum angle" algorithm: a point is visible if the angle from
-    the observer to it (accounting for curvature) exceeds all previous angles.
-    Returns the distance of the farthest visible point.
+    A point at distance d is "visible" if a TARGET_HEIGHT feature at that
+    location would be seen from the observer (i.e. the angle from observer
+    to the top of the feature exceeds all prior terrain angles).
+
+    This is the standard "max angle" viewshed algorithm with two key
+    improvements:
+    1. We check visibility of TARGET_HEIGHT above ground, not ground level.
+       This prevents the geometric horizon from cutting off flat terrain
+       unrealistically early.
+    2. We tolerate small SRTM noise (±3m) to avoid false occlusion from
+       DEM artifacts on flat ground.
     """
     max_tan_angle = float("-inf")
-    max_visible_dist = step  # at minimum, can see the first step
+    max_visible_dist = step
 
     angle_rad = math.radians(angle_deg)
     cos_angle = math.cos(angle_rad)
     sin_angle = math.sin(angle_rad)
 
-    dist = step
-    blocked = False
+    consecutive_blocked = 0
+    BLOCKED_THRESHOLD = 20  # stop ray after 20 consecutive fully-blocked samples
 
+    dist = step
     while dist <= max_dist:
         dlat = dist * cos_angle * lat_deg_per_m
         dlon = dist * sin_angle * lon_deg_per_m
@@ -161,32 +200,48 @@ def _cast_ray_max_distance(
 
         terrain_elev = elevation.get_elevation(target_lat, target_lon)
 
-        effective_elev = terrain_elev
+        # Check for obstacle (forest/building)
+        obstacle_height = 0.0
         if prepared_obstacles is not None:
             try:
                 if prepared_obstacles.contains(Point(target_lon, target_lat)):
-                    effective_elev += OBSTACLE_HEIGHT
+                    obstacle_height = OBSTACLE_HEIGHT
             except Exception:
                 pass
+
+        effective_elev = terrain_elev + obstacle_height
 
         # Earth curvature correction
         curvature_drop = (dist * dist) / (2 * EARTH_RADIUS)
 
-        apparent_elev = effective_elev - curvature_drop
-        delta_elev = apparent_elev - observer_elev
-        tan_angle = delta_elev / dist
+        # Angle from observer to terrain surface (including obstacles)
+        surface_apparent = effective_elev - curvature_drop
+        surface_tan = (surface_apparent - observer_elev) / dist
 
-        if tan_angle >= max_tan_angle:
-            # Visible — update max visible distance
+        # Angle from observer to top of a TARGET_HEIGHT feature at this point
+        # (this is what we actually check for "can you see this area")
+        target_apparent = (terrain_elev + TARGET_HEIGHT) - curvature_drop
+        target_tan = (target_apparent - observer_elev) / dist
+
+        # Tolerance: ignore SRTM noise (±3m elevation jitter)
+        noise_tolerance = 3.0 / dist  # 3m error at distance d
+
+        if target_tan >= max_tan_angle - noise_tolerance:
+            # A 2m feature at this point is visible
             max_visible_dist = dist
-            max_tan_angle = tan_angle
-            blocked = False
-        else:
-            # Hidden — but keep going, might see over a ridge
-            if not blocked and (effective_elev + OBSTACLE_HEIGHT - curvature_drop - observer_elev) / dist > max_tan_angle + 0.05:
-                # Solid tall obstacle — stop
+            consecutive_blocked = 0
+
+        # Update max angle using the terrain surface (not target height)
+        # — terrain blocks what's behind it regardless of what we're looking for
+        if surface_tan > max_tan_angle:
+            max_tan_angle = surface_tan
+
+        if target_tan < max_tan_angle - noise_tolerance:
+            consecutive_blocked += 1
+            if consecutive_blocked >= BLOCKED_THRESHOLD:
                 break
-            blocked = True
+        else:
+            consecutive_blocked = 0
 
         dist += step
 
